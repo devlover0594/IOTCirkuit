@@ -8,6 +8,7 @@ import {
   PlacedComponent,
   PointMm,
   RoutedBoard,
+  TraceConflict,
   TraceSegment,
   ViaPoint,
 } from '../types/pcb';
@@ -439,7 +440,7 @@ export function routePcb(placed: PlacedComponent[], config: BoardConfig): Routed
     }
   }
 
-  // Generate Orthogonal + 45-degree chamfered PCB Copper Traces
+  // Route traces using candidate paths + Grid A* fallback
   const traces: TraceSegment[] = [];
   const vias: ViaPoint[] = [];
   const placedMap = new Map(placed.map((p) => [p.uid, p]));
@@ -456,86 +457,118 @@ export function routePcb(placed: PlacedComponent[], config: BoardConfig): Routed
     const p1 = getPinWorldPos(fromComp, fromPin);
     const p2 = getPinWorldPos(toComp, toPin);
 
-    const isPower = conn.netType === 'power_5v' || conn.netType === 'power_3v3' || conn.netType === 'gnd';
+    const isPower =
+      conn.netType === 'power_5v' || conn.netType === 'power_3v3' || conn.netType === 'gnd';
     const traceWidth = isPower ? Math.max(config.traceWidthMm, 0.8) : config.traceWidthMm;
-
-    // Channel lane offset prevents parallel tracks from overlapping identically
-    const laneOffset = ((idx % 7) - 3) * 1.4;
-    const dx = p2.x - p1.x;
-    const dy = p2.y - p1.y;
-
-    const points: PointMm[] = [p1];
-
-    if (Math.abs(dx) < 0.2 || Math.abs(dy) < 0.2) {
-      points.push(p2);
-    } else {
-      const midX = snap(p1.x + dx * 0.5 + laneOffset, 0.5);
-      const clampedMidX = Math.max(3, Math.min(config.widthMm - 3, midX));
-      const chamfer = Math.min(1.6, Math.abs(clampedMidX - p1.x) * 0.35, Math.abs(dy) * 0.35);
-
-      const signX = clampedMidX >= p1.x ? 1 : -1;
-      const signY = dy >= 0 ? 1 : -1;
-
-      if (chamfer > 0.3) {
-        points.push({ x: clampedMidX - signX * chamfer, y: p1.y });
-        points.push({ x: clampedMidX, y: p1.y + signY * chamfer });
-        points.push({ x: clampedMidX, y: p2.y - signY * chamfer });
-        points.push({ x: clampedMidX + (p2.x >= clampedMidX ? 1 : -1) * chamfer, y: p2.y });
-      } else {
-        points.push({ x: clampedMidX, y: p1.y });
-        points.push({ x: clampedMidX, y: p2.y });
-      }
-      points.push(p2);
-    }
+    const cands = buildRouteCandidates(p1, p2, idx, config.widthMm, config.heightMm);
 
     if (config.copperMode === '1-layer') {
+      let best = pickBestCandidate(cands, traces, 'B.Cu', conn.netName);
+      if (best.conflicts > 0) {
+        const aStarPts = findAStarTracePath(p1, p2, traces, placed, 'B.Cu', conn.netName, config);
+        if (aStarPts) {
+          const aStarConf = countTraceLayerConflicts(aStarPts, traces, 'B.Cu', conn.netName);
+          if (aStarConf < best.conflicts) {
+            best = { pts: aStarPts, conflicts: aStarConf };
+          }
+        }
+      }
+      if (best.conflicts > 0) {
+        warnings.push(
+          `Jalur ${conn.netName} masih bersilangan di mode 1-Layer: gunakan kawat jumper atau aktifkan mode Dual Layer.`
+        );
+      }
       traces.push({
         id: `tr-${idx}`,
         netName: conn.netName,
         netType: conn.netType,
         layer: 'B.Cu',
         widthMm: traceWidth,
-        points,
+        points: best.pts,
       });
     } else {
-      // 2-Layer PCB: route GND/Power predominantly on B.Cu and split signal crossings with a via
-      const useTwoSegmentsWithVia = !isPower && points.length >= 4 && idx % 2 === 1;
-      if (useTwoSegmentsWithVia) {
-        const splitIdx = Math.floor(points.length / 2);
-        const viaPt = points[splitIdx];
-        traces.push({
-          id: `tr-${idx}-a`,
-          netName: conn.netName,
-          netType: conn.netType,
-          layer: 'F.Cu',
-          widthMm: traceWidth,
-          points: points.slice(0, splitIdx + 1),
-        });
-        traces.push({
-          id: `tr-${idx}-b`,
-          netName: conn.netName,
-          netType: conn.netType,
-          layer: 'B.Cu',
-          widthMm: traceWidth,
-          points: points.slice(splitIdx),
-        });
-        vias.push({
-          id: `via-${idx}`,
-          xMm: viaPt.x,
-          yMm: viaPt.y,
-          drillMm: 0.4,
-          padMm: 0.9,
-          netName: conn.netName,
-        });
-      } else {
+      const primaryLayer: 'F.Cu' | 'B.Cu' = isPower ? 'B.Cu' : 'F.Cu';
+      const secondaryLayer: 'F.Cu' | 'B.Cu' = primaryLayer === 'F.Cu' ? 'B.Cu' : 'F.Cu';
+
+      let primaryAttempt = pickBestCandidate(cands, traces, primaryLayer, conn.netName);
+      if (primaryAttempt.conflicts > 0) {
+        const aStarPrimary = findAStarTracePath(p1, p2, traces, placed, primaryLayer, conn.netName, config);
+        if (aStarPrimary) {
+          const c = countTraceLayerConflicts(aStarPrimary, traces, primaryLayer, conn.netName);
+          if (c < primaryAttempt.conflicts) {
+            primaryAttempt = { pts: aStarPrimary, conflicts: c };
+          }
+        }
+      }
+
+      if (primaryAttempt.conflicts === 0) {
         traces.push({
           id: `tr-${idx}`,
           netName: conn.netName,
           netType: conn.netType,
-          layer: isPower ? 'B.Cu' : 'F.Cu',
+          layer: primaryLayer,
           widthMm: traceWidth,
-          points,
+          points: primaryAttempt.pts,
         });
+      } else {
+        let secondaryAttempt = pickBestCandidate(cands, traces, secondaryLayer, conn.netName);
+        if (secondaryAttempt.conflicts > 0) {
+          const aStarSec = findAStarTracePath(p1, p2, traces, placed, secondaryLayer, conn.netName, config);
+          if (aStarSec) {
+            const c = countTraceLayerConflicts(aStarSec, traces, secondaryLayer, conn.netName);
+            if (c < secondaryAttempt.conflicts) {
+              secondaryAttempt = { pts: aStarSec, conflicts: c };
+            }
+          }
+        }
+
+        if (secondaryAttempt.conflicts === 0) {
+          traces.push({
+            id: `tr-${idx}`,
+            netName: conn.netName,
+            netType: conn.netType,
+            layer: secondaryLayer,
+            widthMm: traceWidth,
+            points: secondaryAttempt.pts,
+          });
+        } else if (primaryAttempt.pts.length >= 4) {
+          const splitIdx = Math.floor(primaryAttempt.pts.length / 2);
+          const viaPt = primaryAttempt.pts[splitIdx];
+          traces.push({
+            id: `tr-${idx}-a`,
+            netName: conn.netName,
+            netType: conn.netType,
+            layer: primaryLayer,
+            widthMm: traceWidth,
+            points: primaryAttempt.pts.slice(0, splitIdx + 1),
+          });
+          traces.push({
+            id: `tr-${idx}-b`,
+            netName: conn.netName,
+            netType: conn.netType,
+            layer: secondaryLayer,
+            widthMm: traceWidth,
+            points: primaryAttempt.pts.slice(splitIdx),
+          });
+          vias.push({
+            id: `via-${idx}`,
+            xMm: viaPt.x,
+            yMm: viaPt.y,
+            drillMm: 0.4,
+            padMm: 0.9,
+            netName: conn.netName,
+          });
+        } else {
+          const useSec = secondaryAttempt.conflicts < primaryAttempt.conflicts;
+          traces.push({
+            id: `tr-${idx}`,
+            netName: conn.netName,
+            netType: conn.netType,
+            layer: useSec ? secondaryLayer : primaryLayer,
+            widthMm: traceWidth,
+            points: useSec ? secondaryAttempt.pts : primaryAttempt.pts,
+          });
+        }
       }
     }
   });
@@ -547,5 +580,470 @@ export function routePcb(placed: PlacedComponent[], config: BoardConfig): Routed
     vias,
     bom: buildBom(placed),
     warnings,
+  };
+}
+
+// ================= GEOMETRY, A* PATHFINDER & CONFLICT RESOLVER =================
+
+function ccw(a: PointMm, b: PointMm, c: PointMm): boolean {
+  return (c.y - a.y) * (b.x - a.x) > (b.y - a.y) * (c.x - a.x);
+}
+
+function samePoint(a: PointMm, b: PointMm, tol = 0.35): boolean {
+  return Math.hypot(a.x - b.x, a.y - b.y) <= tol;
+}
+
+function segDist(a: PointMm, b: PointMm, p: PointMm): number {
+  const l2 = (b.x - a.x) ** 2 + (b.y - a.y) ** 2;
+  if (l2 === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2));
+  return Math.hypot(p.x - (a.x + t * (b.x - a.x)), p.y - (a.y + t * (b.y - a.y)));
+}
+
+function getIntersectionPoint(a1: PointMm, a2: PointMm, b1: PointMm, b2: PointMm): PointMm | null {
+  const denom = (a1.x - a2.x) * (b1.y - b2.y) - (a1.y - a2.y) * (b1.x - b2.x);
+  if (Math.abs(denom) < 1e-6) {
+    // Parallel close segments — return midpoint of closest endpoints
+    return { x: (a1.x + a2.x + b1.x + b2.x) / 4, y: (a1.y + a2.y + b1.y + b2.y) / 4 };
+  }
+  const t = ((a1.x - b1.x) * (b1.y - b2.y) - (a1.y - b1.y) * (b1.x - b2.x)) / denom;
+  const u = -((a1.x - a2.x) * (a1.y - b1.y) - (a1.y - a2.y) * (a1.x - b1.x)) / denom;
+  if (t >= -0.02 && t <= 1.02 && u >= -0.02 && u <= 1.02) {
+    return {
+      x: a1.x + t * (a2.x - a1.x),
+      y: a1.y + t * (a2.y - a1.y),
+    };
+  }
+  return { x: (a1.x + a2.x) / 2, y: (a1.y + a2.y) / 2 };
+}
+
+function segmentsConflict(a1: PointMm, a2: PointMm, b1: PointMm, b2: PointMm): boolean {
+  if (
+    samePoint(a1, b1) ||
+    samePoint(a1, b2) ||
+    samePoint(a2, b1) ||
+    samePoint(a2, b2)
+  ) {
+    return false;
+  }
+  const intersects =
+    ccw(a1, b1, b2) !== ccw(a2, b1, b2) && ccw(a1, a2, b1) !== ccw(a1, a2, b2);
+  if (intersects) return true;
+
+  const minD = Math.min(
+    segDist(a1, a2, b1),
+    segDist(a1, a2, b2),
+    segDist(b1, b2, a1),
+    segDist(b1, b2, a2)
+  );
+  return minD < 0.65;
+}
+
+function makeChamferedMidX(p1: PointMm, p2: PointMm, midXRaw: number, boardW: number): PointMm[] {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  if (Math.abs(dx) < 0.2 || Math.abs(dy) < 0.2) return [p1, p2];
+  const clampedMidX = Math.max(2.5, Math.min(boardW - 2.5, snap(midXRaw, 0.5)));
+  const chamfer = Math.min(1.5, Math.abs(clampedMidX - p1.x) * 0.35, Math.abs(dy) * 0.35);
+  const signX = clampedMidX >= p1.x ? 1 : -1;
+  const signY = dy >= 0 ? 1 : -1;
+  const pts: PointMm[] = [p1];
+  if (chamfer > 0.3) {
+    pts.push({ x: clampedMidX - signX * chamfer, y: p1.y });
+    pts.push({ x: clampedMidX, y: p1.y + signY * chamfer });
+    pts.push({ x: clampedMidX, y: p2.y - signY * chamfer });
+    pts.push({ x: clampedMidX + (p2.x >= clampedMidX ? 1 : -1) * chamfer, y: p2.y });
+  } else {
+    pts.push({ x: clampedMidX, y: p1.y });
+    pts.push({ x: clampedMidX, y: p2.y });
+  }
+  pts.push(p2);
+  return pts;
+}
+
+function makeChamferedMidY(p1: PointMm, p2: PointMm, midYRaw: number, boardH: number): PointMm[] {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  if (Math.abs(dx) < 0.2 || Math.abs(dy) < 0.2) return [p1, p2];
+  const clampedMidY = Math.max(2.5, Math.min(boardH - 2.5, snap(midYRaw, 0.5)));
+  const chamfer = Math.min(1.5, Math.abs(dx) * 0.35, Math.abs(clampedMidY - p1.y) * 0.35);
+  const signX = dx >= 0 ? 1 : -1;
+  const signY = clampedMidY >= p1.y ? 1 : -1;
+  const pts: PointMm[] = [p1];
+  if (chamfer > 0.3) {
+    pts.push({ x: p1.x, y: clampedMidY - signY * chamfer });
+    pts.push({ x: p1.x + signX * chamfer, y: clampedMidY });
+    pts.push({ x: p2.x - signX * chamfer, y: clampedMidY });
+    pts.push({ x: p2.x, y: clampedMidY + (p2.y >= clampedMidY ? 1 : -1) * chamfer });
+  } else {
+    pts.push({ x: p1.x, y: clampedMidY });
+    pts.push({ x: p2.x, y: clampedMidY });
+  }
+  pts.push(p2);
+  return pts;
+}
+
+function buildRouteCandidates(
+  p1: PointMm,
+  p2: PointMm,
+  idx: number,
+  boardW: number,
+  boardH: number
+): PointMm[][] {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const baseLane = ((idx % 5) - 2) * 1.6;
+  const cands: PointMm[][] = [];
+
+  for (const off of [0, 1.8, -1.8, 3.8, -3.8, 6.5, -6.5]) {
+    cands.push(makeChamferedMidX(p1, p2, p1.x + dx * 0.5 + baseLane + off, boardW));
+  }
+  for (const off of [0, 2.0, -2.0, 4.5, -4.5]) {
+    cands.push(makeChamferedMidY(p1, p2, p1.y + dy * 0.5 + baseLane + off, boardH));
+  }
+  cands.push([p1, { x: p2.x, y: p1.y }, p2]);
+  cands.push([p1, { x: p1.x, y: p2.y }, p2]);
+  cands.push(makeChamferedMidY(p1, p2, 3.8, boardH));
+  cands.push(makeChamferedMidY(p1, p2, boardH - 3.8, boardH));
+  cands.push(makeChamferedMidX(p1, p2, 3.8, boardW));
+  cands.push(makeChamferedMidX(p1, p2, boardW - 3.8, boardW));
+
+  return cands;
+}
+
+function countTraceLayerConflicts(
+  pts: PointMm[],
+  existingTraces: TraceSegment[],
+  layer: 'F.Cu' | 'B.Cu',
+  netName: string,
+  ignoreTraceId?: string
+): number {
+  let conflicts = 0;
+  const existing = existingTraces.filter(
+    (t) => t.layer === layer && t.netName !== netName && t.id !== ignoreTraceId
+  );
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a1 = pts[i];
+    const a2 = pts[i + 1];
+    for (const ex of existing) {
+      for (let j = 0; j < ex.points.length - 1; j++) {
+        if (segmentsConflict(a1, a2, ex.points[j], ex.points[j + 1])) {
+          conflicts++;
+        }
+      }
+    }
+  }
+  return conflicts;
+}
+
+function pickBestCandidate(
+  cands: PointMm[][],
+  existingTraces: TraceSegment[],
+  layer: 'F.Cu' | 'B.Cu',
+  netName: string,
+  ignoreTraceId?: string
+): { pts: PointMm[]; conflicts: number } {
+  let bestPts = cands[0];
+  let bestConflicts = Infinity;
+  for (const cand of cands) {
+    const c = countTraceLayerConflicts(cand, existingTraces, layer, netName, ignoreTraceId);
+    if (c === 0) return { pts: cand, conflicts: 0 };
+    if (c < bestConflicts) {
+      bestConflicts = c;
+      bestPts = cand;
+    }
+  }
+  return { pts: bestPts, conflicts: bestConflicts };
+}
+
+function findAStarTracePath(
+  p1: PointMm,
+  p2: PointMm,
+  existingTraces: TraceSegment[],
+  placed: PlacedComponent[],
+  layer: 'F.Cu' | 'B.Cu',
+  netName: string,
+  config: BoardConfig,
+  ignoreTraceId?: string
+): PointMm[] | null {
+  const step = 1.5;
+  const cols = Math.max(10, Math.floor(config.widthMm / step) + 1);
+  const rows = Math.max(10, Math.floor(config.heightMm / step) + 1);
+
+  const toCell = (pt: PointMm) => ({
+    gx: Math.max(1, Math.min(cols - 2, Math.round(pt.x / step))),
+    gy: Math.max(1, Math.min(rows - 2, Math.round(pt.y / step))),
+  });
+
+  const start = toCell(p1);
+  const goal = toCell(p2);
+
+  // Build obstacle bitmap for pads & existing same-layer traces
+  const blocked = new Uint8Array(cols * rows);
+  const activeLayerTraces = existingTraces.filter(
+    (t) => t.layer === layer && t.netName !== netName && t.id !== ignoreTraceId
+  );
+
+  for (const tr of activeLayerTraces) {
+    for (let i = 0; i < tr.points.length - 1; i++) {
+      const a = tr.points[i];
+      const b = tr.points[i + 1];
+      const minGx = Math.max(0, Math.floor(Math.min(a.x, b.x) / step) - 1);
+      const maxGx = Math.min(cols - 1, Math.ceil(Math.max(a.x, b.x) / step) + 1);
+      const minGy = Math.max(0, Math.floor(Math.min(a.y, b.y) / step) - 1);
+      const maxGy = Math.min(rows - 1, Math.ceil(Math.max(a.y, b.y) / step) + 1);
+      for (let gy = minGy; gy <= maxGy; gy++) {
+        for (let gx = minGx; gx <= maxGx; gx++) {
+          const pt = { x: gx * step, y: gy * step };
+          if (segDist(a, b, pt) < 0.95) {
+            blocked[gy * cols + gx] = 1;
+          }
+        }
+      }
+    }
+  }
+
+  for (const comp of placed) {
+    const def = CATALOG_MAP[comp.defId];
+    if (!def) continue;
+    for (const pin of def.pins) {
+      const pos = getPinWorldPos(comp, pin);
+      if (samePoint(pos, p1, 1.3) || samePoint(pos, p2, 1.3)) continue;
+      const c = toCell(pos);
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = c.gx + dx;
+          const ny = c.gy + dy;
+          if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
+            const pt = { x: nx * step, y: ny * step };
+            if (Math.hypot(pt.x - pos.x, pt.y - pos.y) < pin.padMm / 2 + 0.55) {
+              blocked[ny * cols + nx] = 1;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Ensure start & goal cells remain open
+  blocked[start.gy * cols + start.gx] = 0;
+  blocked[goal.gy * cols + goal.gx] = 0;
+
+  const startIdx = start.gy * cols + start.gx;
+  const goalIdx = goal.gy * cols + goal.gx;
+
+  const gScore = new Float32Array(cols * rows).fill(Infinity);
+  const parent = new Int32Array(cols * rows).fill(-1);
+  const dirTaken = new Int8Array(cols * rows).fill(-1);
+  const closed = new Uint8Array(cols * rows);
+
+  gScore[startIdx] = 0;
+  const open: Array<{ idx: number; f: number }> = [
+    { idx: startIdx, f: Math.abs(goal.gx - start.gx) + Math.abs(goal.gy - start.gy) },
+  ];
+
+  const dirs = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ];
+
+  let found = false;
+  let iterations = 0;
+  const maxIterations = cols * rows * 2;
+
+  while (open.length > 0 && iterations++ < maxIterations) {
+    // Pop lowest f
+    let bestI = 0;
+    for (let i = 1; i < open.length; i++) {
+      if (open[i].f < open[bestI].f) bestI = i;
+    }
+    const cur = open.splice(bestI, 1)[0];
+    if (cur.idx === goalIdx) {
+      found = true;
+      break;
+    }
+    if (closed[cur.idx]) continue;
+    closed[cur.idx] = 1;
+
+    const cx = cur.idx % cols;
+    const cy = Math.floor(cur.idx / cols);
+
+    for (let d = 0; d < 4; d++) {
+      const nx = cx + dirs[d][0];
+      const ny = cy + dirs[d][1];
+      if (nx <= 0 || nx >= cols - 1 || ny <= 0 || ny >= rows - 1) continue;
+      const nIdx = ny * cols + nx;
+      if (closed[nIdx] || blocked[nIdx]) continue;
+
+      const turnPenalty = dirTaken[cur.idx] !== -1 && dirTaken[cur.idx] !== d ? 0.35 : 0;
+      const tentativeG = gScore[cur.idx] + 1 + turnPenalty;
+      if (tentativeG < gScore[nIdx]) {
+        parent[nIdx] = cur.idx;
+        dirTaken[nIdx] = d;
+        gScore[nIdx] = tentativeG;
+        const h = Math.abs(goal.gx - nx) + Math.abs(goal.gy - ny);
+        open.push({ idx: nIdx, f: tentativeG + h });
+      }
+    }
+  }
+
+  if (!found) return null;
+
+  // Reconstruct grid points
+  const rawPts: PointMm[] = [];
+  let traceIdx = goalIdx;
+  while (traceIdx !== -1 && traceIdx !== startIdx) {
+    const gx = traceIdx % cols;
+    const gy = Math.floor(traceIdx / cols);
+    rawPts.push({ x: Number((gx * step).toFixed(2)), y: Number((gy * step).toFixed(2)) });
+    traceIdx = parent[traceIdx];
+  }
+  rawPts.reverse();
+
+  const fullPts: PointMm[] = [p1, ...rawPts.slice(1, -1), p2];
+  // Prune collinear points for clean crisp vectors
+  const pruned: PointMm[] = [fullPts[0]];
+  for (let i = 1; i < fullPts.length - 1; i++) {
+    const prev = pruned[pruned.length - 1];
+    const curr = fullPts[i];
+    const next = fullPts[i + 1];
+    const colX = Math.abs(prev.x - curr.x) < 0.05 && Math.abs(curr.x - next.x) < 0.05;
+    const colY = Math.abs(prev.y - curr.y) < 0.05 && Math.abs(curr.y - next.y) < 0.05;
+    if (!colX && !colY) {
+      pruned.push(curr);
+    }
+  }
+  pruned.push(fullPts[fullPts.length - 1]);
+  return pruned;
+}
+
+export function detectTraceConflicts(traces: TraceSegment[]): TraceConflict[] {
+  const conflicts: TraceConflict[] = [];
+  const seenPairs = new Set<string>();
+
+  for (let i = 0; i < traces.length; i++) {
+    const ta = traces[i];
+    if (ta.points.length < 2) continue;
+
+    for (let j = i + 1; j < traces.length; j++) {
+      const tb = traces[j];
+      if (tb.points.length < 2) continue;
+      if (ta.layer !== tb.layer || ta.netName === tb.netName) continue;
+
+      let hitPoint: PointMm | null = null;
+      for (let sa = 0; sa < ta.points.length - 1 && !hitPoint; sa++) {
+        for (let sb = 0; sb < tb.points.length - 1; sb++) {
+          if (segmentsConflict(ta.points[sa], ta.points[sa + 1], tb.points[sb], tb.points[sb + 1])) {
+            hitPoint = getIntersectionPoint(
+              ta.points[sa],
+              ta.points[sa + 1],
+              tb.points[sb],
+              tb.points[sb + 1]
+            );
+            break;
+          }
+        }
+      }
+
+      if (hitPoint) {
+        const key = `${ta.id}::${tb.id}`;
+        if (!seenPairs.has(key)) {
+          seenPairs.add(key);
+          conflicts.push({
+            id: `conf-${conflicts.length}`,
+            xMm: Number(hitPoint.x.toFixed(2)),
+            yMm: Number(hitPoint.y.toFixed(2)),
+            layer: ta.layer,
+            traceAId: ta.id,
+            traceBId: tb.id,
+            netA: ta.netName,
+            netB: tb.netName,
+          });
+        }
+      }
+    }
+  }
+
+  return conflicts;
+}
+
+export function resolveTraceConflicts(
+  traces: TraceSegment[],
+  vias: ViaPoint[],
+  placed: PlacedComponent[],
+  config: BoardConfig
+): { traces: TraceSegment[]; vias: ViaPoint[]; remainingConflicts: TraceConflict[]; fixedCount: number } {
+  let workingTraces = traces.map((t) => ({ ...t, points: [...t.points] }));
+  const workingVias = [...vias];
+  let fixedCount = 0;
+
+  // Up to 3 passes to resolve cascading or two-sided conflicts cleanly
+  for (let pass = 0; pass < 3; pass++) {
+    const currentConflicts = detectTraceConflicts(workingTraces);
+    if (currentConflicts.length === 0) break;
+
+    const conflictingIds = new Set<string>();
+    for (const c of currentConflicts) {
+      conflictingIds.add(c.traceBId);
+      if (pass >= 1) {
+        conflictingIds.add(c.traceAId);
+      }
+    }
+
+    for (const tid of conflictingIds) {
+      const tIdx = workingTraces.findIndex((t) => t.id === tid);
+      if (tIdx === -1) continue;
+      const tr = workingTraces[tIdx];
+      if (tr.points.length < 2) continue;
+
+      const p1 = tr.points[0];
+      const p2 = tr.points[tr.points.length - 1];
+      const others = workingTraces.filter((_, i) => i !== tIdx);
+      const currentConf = countTraceLayerConflicts(tr.points, others, tr.layer, tr.netName);
+      if (currentConf === 0) continue;
+
+      const cands = buildRouteCandidates(p1, p2, tIdx, config.widthMm, config.heightMm);
+
+      // 1. Try clean orthogonal candidate or A* on current layer
+      const sameLayerCand = pickBestCandidate(cands, others, tr.layer, tr.netName);
+      if (sameLayerCand.conflicts === 0) {
+        workingTraces[tIdx] = { ...tr, points: sameLayerCand.pts };
+        fixedCount++;
+        continue;
+      }
+
+      const aStarSame = findAStarTracePath(p1, p2, others, placed, tr.layer, tr.netName, config);
+      if (aStarSame && countTraceLayerConflicts(aStarSame, others, tr.layer, tr.netName) === 0) {
+        workingTraces[tIdx] = { ...tr, points: aStarSame };
+        fixedCount++;
+        continue;
+      }
+
+      // 2. If 2-layer mode, move trace cleanly to opposite layer (or A* on opposite layer)
+      if (config.copperMode === '2-layer') {
+        const oppLayer: 'F.Cu' | 'B.Cu' = tr.layer === 'F.Cu' ? 'B.Cu' : 'F.Cu';
+        const oppCand = pickBestCandidate(cands, others, oppLayer, tr.netName);
+        if (oppCand.conflicts === 0) {
+          workingTraces[tIdx] = { ...tr, layer: oppLayer, points: oppCand.pts };
+          fixedCount++;
+          continue;
+        }
+        const aStarOpp = findAStarTracePath(p1, p2, others, placed, oppLayer, tr.netName, config);
+        if (aStarOpp && countTraceLayerConflicts(aStarOpp, others, oppLayer, tr.netName) === 0) {
+          workingTraces[tIdx] = { ...tr, layer: oppLayer, points: aStarOpp };
+          fixedCount++;
+          continue;
+        }
+      }
+    }
+  }
+
+  return {
+    traces: workingTraces,
+    vias: workingVias,
+    remainingConflicts: detectTraceConflicts(workingTraces),
+    fixedCount,
   };
 }

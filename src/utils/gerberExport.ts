@@ -287,46 +287,66 @@ export async function exportGerberZip(routed: RoutedBoard, config: BoardConfig):
   triggerDownload(blob, `${safeName}_gerber.zip`);
 }
 
-export function generateTonerTransferSvgString(
+function buildSingleLayerTonerGroup(
+  layer: 'F.Cu' | 'B.Cu',
   routed: RoutedBoard,
-  config: BoardConfig
-): string {
-  const margin = 4; // 4mm margin around board outline for crop marks
-  const totalW = config.widthMm + margin * 2;
-  const totalH = config.heightMm + margin * 2;
-
-  const transformX = (x: number) => (config.mirrorToner ? config.widthMm - x + margin : x + margin);
-  const transformY = (y: number) => y + margin;
-
+  config: BoardConfig,
+  offsetX: number,
+  offsetY: number
+): string[] {
   const parts: string[] = [];
-  parts.push(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${totalW}mm" height="${totalH}mm" viewBox="0 0 ${totalW} ${totalH}">`
-  );
-  parts.push(`<rect x="0" y="0" width="${totalW}" height="${totalH}" fill="#ffffff" />`);
+  // For toner transfer:
+  // If mirrorToner is enabled, Bottom (B.Cu) or Top (F.Cu) mirrors horizontally according to user toggle.
+  // Specifically, in dual-layer toner transfer, ironing onto Top Copper requires F.Cu mirrored relative to top view,
+  // whereas ironing onto Bottom Copper (after flipping board) requires B.Cu un-mirrored relative to top view (or mirrored if printing directly from bottom view).
+  // Here we apply config.mirrorToner cleanly so user has deterministic control, and label each sheet explicitly.
+  const shouldMirror =
+    config.copperMode === '2-layer' && config.printLayerMode === 'both'
+      ? layer === 'F.Cu'
+        ? config.mirrorToner
+        : !config.mirrorToner
+      : config.mirrorToner;
+
+  const tx = (x: number) => offsetX + (shouldMirror ? config.widthMm - x : x);
+  const ty = (y: number) => offsetY + y;
+
   // Board outline cut guide
   parts.push(
-    `<rect x="${margin}" y="${margin}" width="${config.widthMm}" height="${config.heightMm}" fill="none" stroke="#000000" stroke-width="0.25" />`
+    `<rect x="${offsetX}" y="${offsetY}" width="${config.widthMm}" height="${config.heightMm}" fill="none" stroke="#000000" stroke-width="0.28" />`
   );
 
-  // Traces (Bottom Copper for DIY etching, or all copper if single-sided)
-  for (const tr of routed.traces) {
+  // Corner crop marks
+  const corners: Array<[number, number, number, number]> = [
+    [offsetX, offsetY, -1, -1],
+    [offsetX + config.widthMm, offsetY, 1, -1],
+    [offsetX, offsetY + config.heightMm, -1, 1],
+    [offsetX + config.widthMm, offsetY + config.heightMm, 1, 1],
+  ];
+  for (const [cx, cy, sx, sy] of corners) {
+    parts.push(`<line x1="${cx}" y1="${cy}" x2="${cx + sx * 3}" y2="${cy}" stroke="#000000" stroke-width="0.2" />`);
+    parts.push(`<line x1="${cx}" y1="${cy}" x2="${cx}" y2="${cy + sy * 3}" stroke="#000000" stroke-width="0.2" />`);
+  }
+
+  // ONLY traces belonging to this copper layer!
+  const layerTraces = routed.traces.filter((t) => t.layer === layer);
+  for (const tr of layerTraces) {
     if (tr.points.length < 2) continue;
     const d = tr.points
-      .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${transformX(pt.x).toFixed(3)} ${transformY(pt.y).toFixed(3)}`)
+      .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${tx(pt.x).toFixed(3)} ${ty(pt.y).toFixed(3)}`)
       .join(' ');
     parts.push(
       `<path d="${d}" fill="none" stroke="#000000" stroke-width="${tr.widthMm}" stroke-linecap="round" stroke-linejoin="round" />`
     );
   }
 
-  // Component Pads (Black copper ring + white drill center for manual drilling)
+  // THT Component Pads (present on both Top and Bottom copper)
   for (const comp of routed.placed) {
     const def = CATALOG_MAP[comp.defId];
     if (!def) continue;
     for (const pin of def.pins) {
       const pos = getPinWorldPos(comp, pin);
-      const cx = transformX(pos.x);
-      const cy = transformY(pos.y);
+      const cx = tx(pos.x);
+      const cy = ty(pos.y);
       parts.push(`<circle cx="${cx.toFixed(3)}" cy="${cy.toFixed(3)}" r="${(pin.padMm / 2).toFixed(3)}" fill="#000000" />`);
       if (config.showDrillGuides && pin.drillMm > 0) {
         parts.push(
@@ -336,10 +356,10 @@ export function generateTonerTransferSvgString(
     }
   }
 
-  // Vias
+  // Vias (present on both layers in 2-layer mode)
   for (const via of routed.vias) {
-    const cx = transformX(via.xMm);
-    const cy = transformY(via.yMm);
+    const cx = tx(via.xMm);
+    const cy = ty(via.yMm);
     parts.push(`<circle cx="${cx.toFixed(3)}" cy="${cy.toFixed(3)}" r="${(via.padMm / 2).toFixed(3)}" fill="#000000" />`);
     if (config.showDrillGuides) {
       parts.push(`<circle cx="${cx.toFixed(3)}" cy="${cy.toFixed(3)}" r="0.22" fill="#ffffff" />`);
@@ -349,17 +369,74 @@ export function generateTonerTransferSvgString(
   // Mounting Holes
   if (config.mountingHoles) {
     for (const mh of getMountingHolePositions(config)) {
-      const cx = transformX(mh.x);
-      const cy = transformY(mh.y);
+      const cx = tx(mh.x);
+      const cy = ty(mh.y);
       parts.push(`<circle cx="${cx.toFixed(3)}" cy="${cy.toFixed(3)}" r="1.6" fill="none" stroke="#000000" stroke-width="0.2" />`);
       parts.push(`<line x1="${cx - 2}" y1="${cy}" x2="${cx + 2}" y2="${cy}" stroke="#000000" stroke-width="0.15" />`);
       parts.push(`<line x1="${cx}" y1="${cy - 2}" x2="${cx}" y2="${cy + 2}" stroke="#000000" stroke-width="0.15" />`);
     }
   }
 
+  // Layer Header & Footer Stamp
+  const layerLabel = layer === 'F.Cu' ? 'LAYER TOP (F.Cu)' : 'LAYER BOTTOM (B.Cu)';
   parts.push(
-    `<text x="${margin + 2}" y="${totalH - 1.2}" font-family="monospace" font-size="2.2" fill="#000000">${config.projectName} | ${config.widthMm}x${config.heightMm}mm | ${config.mirrorToner ? 'MIRRORED' : 'TOP VIEW'} 1:1</text>`
+    `<text x="${offsetX}" y="${offsetY - 1.5}" font-family="monospace" font-size="2.4" font-weight="bold" fill="#000000">${layerLabel} — ${layerTraces.length} Jalur (${shouldMirror ? 'MIRRORED' : 'NORMAL'})</text>`
   );
+  parts.push(
+    `<text x="${offsetX}" y="${offsetY + config.heightMm + 3.8}" font-family="monospace" font-size="2.0" fill="#000000">${config.projectName} | ${config.widthMm}×${config.heightMm}mm | SKALA 1:1</text>`
+  );
+
+  // 10mm physical calibration bar
+  const calX1 = offsetX + config.widthMm - 12;
+  const calX2 = offsetX + config.widthMm - 2;
+  const calY = offsetY + config.heightMm + 3.0;
+  parts.push(`<line x1="${calX1}" y1="${calY}" x2="${calX2}" y2="${calY}" stroke="#000000" stroke-width="0.35" />`);
+  parts.push(`<line x1="${calX1}" y1="${calY - 1}" x2="${calX1}" y2="${calY + 1}" stroke="#000000" stroke-width="0.25" />`);
+  parts.push(`<line x1="${calX2}" y1="${calY - 1}" x2="${calX2}" y2="${calY + 1}" stroke="#000000" stroke-width="0.25" />`);
+  parts.push(`<text x="${(calX1 + calX2) / 2}" y="${calY + 2.5}" text-anchor="middle" font-family="monospace" font-size="1.7" fill="#000000">10 mm</text>`);
+
+  return parts;
+}
+
+export function generateTonerTransferSvgString(
+  routed: RoutedBoard,
+  config: BoardConfig
+): string {
+  const marginX = 6;
+  const marginTop = 8;
+  const marginBottom = 9;
+  const gapBetween = 12;
+
+  const isDualBoth = config.copperMode === '2-layer' && config.printLayerMode === 'both';
+  const stackVertically = isDualBoth && config.widthMm > 95;
+
+  const totalW =
+    isDualBoth && !stackVertically
+      ? config.widthMm * 2 + gapBetween + marginX * 2
+      : config.widthMm + marginX * 2;
+  const totalH =
+    isDualBoth && stackVertically
+      ? config.heightMm * 2 + gapBetween + marginTop + marginBottom
+      : config.heightMm + marginTop + marginBottom;
+
+  const parts: string[] = [];
+  parts.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${totalW}mm" height="${totalH}mm" viewBox="0 0 ${totalW} ${totalH}">`
+  );
+  parts.push(`<rect x="0" y="0" width="${totalW}" height="${totalH}" fill="#ffffff" />`);
+
+  if (config.copperMode === '1-layer' || config.printLayerMode === 'bottom') {
+    parts.push(...buildSingleLayerTonerGroup('B.Cu', routed, config, marginX, marginTop));
+  } else if (config.printLayerMode === 'top') {
+    parts.push(...buildSingleLayerTonerGroup('F.Cu', routed, config, marginX, marginTop));
+  } else {
+    // Both layers printed together (Top F.Cu + Bottom B.Cu)
+    parts.push(...buildSingleLayerTonerGroup('F.Cu', routed, config, marginX, marginTop));
+    const secondX = stackVertically ? marginX : marginX + config.widthMm + gapBetween;
+    const secondY = stackVertically ? marginTop + config.heightMm + gapBetween : marginTop;
+    parts.push(...buildSingleLayerTonerGroup('B.Cu', routed, config, secondX, secondY));
+  }
+
   parts.push('</svg>');
   return parts.join('\n');
 }

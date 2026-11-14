@@ -1,6 +1,7 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  CheckCircle2,
   Download,
   FilePlus2,
   Layers,
@@ -9,6 +10,7 @@ import {
   RotateCw,
   Search,
   Trash2,
+  Wand2,
 } from 'lucide-react';
 import { BomTable } from './components/BomTable';
 import { MermaidViewer } from './components/MermaidViewer';
@@ -23,10 +25,21 @@ import {
 import {
   BoardConfig,
   ComponentCategory,
+  NetConnection,
+  PcbToolMode,
   PlacedComponent,
+  PointMm,
+  RoutedBoard,
+  TraceSegment,
+  ViaPoint,
   ViewMode,
 } from './types/pcb';
-import { autoPlaceComponents, routePcb } from './utils/autoRouter';
+import {
+  autoPlaceComponents,
+  detectTraceConflicts,
+  resolveTraceConflicts,
+  routePcb,
+} from './utils/autoRouter';
 import {
   exportBoardToJson,
   parseJsonToPcb,
@@ -70,6 +83,8 @@ export default function App() {
     widthMm: INITIAL_PRESET.boardWidthMm,
     heightMm: INITIAL_PRESET.boardHeightMm,
     copperMode: '1-layer',
+    visibleLayer: 'all',
+    printLayerMode: 'both',
     traceWidthMm: 0.6,
     solderMask: 'green',
     mirrorToner: true,
@@ -87,13 +102,46 @@ export default function App() {
   );
 
   const [selectedUid, setSelectedUid] = useState<string | null>(null);
+  const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+  const [toolMode, setToolMode] = useState<PcbToolMode>('select');
+  const [drawLayer, setDrawLayer] = useState<'F.Cu' | 'B.Cu'>('B.Cu');
+
+  const [editedTraces, setEditedTraces] = useState<Record<string, TraceSegment>>({});
+  const [deletedTraceIds, setDeletedTraceIds] = useState<Set<string>>(() => new Set());
+  const [customTraces, setCustomTraces] = useState<TraceSegment[]>([]);
+  const [customVias, setCustomVias] = useState<ViaPoint[]>([]);
+  const [fixNotice, setFixNotice] = useState<string | null>(null);
+
   const [diagramSubTab, setDiagramSubTab] = useState<'mermaid' | 'json'>('mermaid');
   const [sketchCode, setSketchCode] = useState<string>(SAMPLE_SKETCHES[0].code);
   const [extractedPins, setExtractedPins] = useState<ParsedPinSymbol[]>([]);
   const [detectedLibs, setDetectedLibs] = useState<string[]>([]);
   const [isExporting, setIsExporting] = useState(false);
 
-  const routed = useMemo(() => routePcb(placed, config), [placed, config]);
+  const autoRouted = useMemo(() => routePcb(placed, config), [placed, config]);
+
+  const routed: RoutedBoard = useMemo(() => {
+    const mergedAutoTraces = autoRouted.traces
+      .filter((t) => !deletedTraceIds.has(t.id))
+      .map((t) => {
+        const edited = editedTraces[t.id];
+        if (!edited) return t;
+        return config.copperMode === '1-layer' ? { ...edited, layer: 'B.Cu' as const } : edited;
+      });
+
+    const normalizedCustom = customTraces.map((t) =>
+      config.copperMode === '1-layer' ? { ...t, layer: 'B.Cu' as const } : t
+    );
+
+    return {
+      ...autoRouted,
+      traces: [...mergedAutoTraces, ...normalizedCustom],
+      vias: [...autoRouted.vias, ...customVias],
+    };
+  }, [autoRouted, deletedTraceIds, editedTraces, customTraces, customVias, config.copperMode]);
+
+  const conflicts = useMemo(() => detectTraceConflicts(routed.traces), [routed.traces]);
+
   const mermaidScript = useMemo(
     () => generateMermaidScript(routed.placed, routed.connections),
     [routed.placed, routed.connections]
@@ -117,6 +165,27 @@ export default function App() {
     });
   }, [categoryFilter, searchQuery]);
 
+  const resetTraceEdits = () => {
+    setEditedTraces({});
+    setDeletedTraceIds(new Set());
+    setCustomTraces([]);
+    setCustomVias([]);
+    setSelectedTraceId(null);
+    setFixNotice(null);
+  };
+
+  useEffect(() => {
+    if (config.copperMode === '1-layer' && drawLayer !== 'B.Cu') {
+      setDrawLayer('B.Cu');
+    }
+  }, [config.copperMode, drawLayer]);
+
+  useEffect(() => {
+    if (!fixNotice) return;
+    const timer = window.setTimeout(() => setFixNotice(null), 4500);
+    return () => window.clearTimeout(timer);
+  }, [fixNotice]);
+
   const handleUpdateConfig = (patch: Partial<BoardConfig>) => {
     setConfig((prev) => ({ ...prev, ...patch }));
   };
@@ -131,12 +200,19 @@ export default function App() {
       [...overrides, undefined]
     );
     setPlaced(nextPlaced);
+    setEditedTraces({});
+    setDeletedTraceIds(new Set());
     const newest = nextPlaced[nextPlaced.length - 1];
-    if (newest) setSelectedUid(newest.uid);
+    if (newest) {
+      setSelectedUid(newest.uid);
+      setSelectedTraceId(null);
+    }
   };
 
   const handleRemoveComponent = (uid: string) => {
     setPlaced((prev) => prev.filter((p) => p.uid !== uid));
+    setEditedTraces({});
+    setDeletedTraceIds(new Set());
     if (selectedUid === uid) setSelectedUid(null);
   };
 
@@ -144,6 +220,19 @@ export default function App() {
     setPlaced((prev) =>
       prev.map((p) => (p.uid === uid ? { ...p, xMm, yMm } : p))
     );
+    // Clear edited trace overrides attached to the moved component so auto-traces stay snapped to its pads
+    setEditedTraces((prev) => {
+      if (Object.keys(prev).length === 0) return prev;
+      const next = { ...prev };
+      autoRouted.connections.forEach((conn, idx) => {
+        if (conn.fromUid === uid || conn.toUid === uid) {
+          delete next[`tr-${idx}`];
+          delete next[`tr-${idx}-a`];
+          delete next[`tr-${idx}-b`];
+        }
+      });
+      return next;
+    });
   };
 
   const handleRotateComponent = (uid: string) => {
@@ -154,12 +243,27 @@ export default function App() {
           : p
       )
     );
+    setEditedTraces((prev) => {
+      if (Object.keys(prev).length === 0) return prev;
+      const next = { ...prev };
+      autoRouted.connections.forEach((conn, idx) => {
+        if (conn.fromUid === uid || conn.toUid === uid) {
+          delete next[`tr-${idx}`];
+          delete next[`tr-${idx}-a`];
+          delete next[`tr-${idx}-b`];
+        }
+      });
+      return next;
+    });
   };
 
   const handleAutoArrange = () => {
     const ids = placed.map((p) => p.defId);
     const overrides = placed.map((p) => p.pinOverrides);
     setPlaced(autoPlaceComponents(ids, config.widthMm, config.heightMm, overrides));
+    setEditedTraces({});
+    setDeletedTraceIds(new Set());
+    setSelectedTraceId(null);
   };
 
   const handleApplyPreset = (presetId: string) => {
@@ -178,6 +282,7 @@ export default function App() {
         preset.boardHeightMm
       )
     );
+    resetTraceEdits();
     setSelectedUid(null);
   };
 
@@ -186,7 +291,6 @@ export default function App() {
     setExtractedPins(res.extractedPins);
     setDetectedLibs(res.detectedLibraries);
 
-    // Adjust board dimensions dynamically based on component count
     const neededW = res.componentIds.length > 7 ? 115 : 98;
     const neededH = res.componentIds.length > 7 ? 82 : 74;
 
@@ -203,6 +307,7 @@ export default function App() {
       res.pinOverridesList
     );
     setPlaced(nextPlaced);
+    resetTraceEdits();
     setSelectedUid(null);
     setViewMode('pcb');
   };
@@ -215,6 +320,7 @@ export default function App() {
   const handleNewBoard = () => {
     setPlaced([]);
     setSelectedUid(null);
+    resetTraceEdits();
     setExtractedPins([]);
     setDetectedLibs([]);
     setConfig((prev) => ({
@@ -239,6 +345,7 @@ export default function App() {
       heightMm: res.boardHeightMm ?? prev.heightMm,
     }));
     setPlaced(res.placed);
+    resetTraceEdits();
     setSelectedUid(null);
     setViewMode('pcb');
   };
@@ -253,8 +360,120 @@ export default function App() {
       copperMode: res.copperMode ?? prev.copperMode,
     }));
     setPlaced(res.placed);
+    resetTraceEdits();
     setSelectedUid(null);
     setViewMode('pcb');
+  };
+
+  const handleAddCustomTrace = (
+    points: PointMm[],
+    layer: 'F.Cu' | 'B.Cu',
+    netName?: string,
+    netType?: NetConnection['netType']
+  ) => {
+    if (points.length < 2) return;
+    const effectiveLayer: 'F.Cu' | 'B.Cu' =
+      config.copperMode === '1-layer' ? 'B.Cu' : layer;
+    const id = `custom-tr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+    const newTrace: TraceSegment = {
+      id,
+      netName: netName || `MANUAL_${customTraces.length + 1}`,
+      netType: netType || 'signal',
+      layer: effectiveLayer,
+      widthMm: config.traceWidthMm,
+      points,
+    };
+    setCustomTraces((prev) => [...prev, newTrace]);
+    setSelectedTraceId(id);
+    setSelectedUid(null);
+  };
+
+  const handleUpdateTrace = (
+    traceId: string,
+    patch: Partial<TraceSegment>
+  ) => {
+    if (traceId.startsWith('custom-')) {
+      setCustomTraces((prev) =>
+        prev.map((t) => (t.id === traceId ? { ...t, ...patch } : t))
+      );
+      return;
+    }
+    const baseTrace =
+      editedTraces[traceId] ?? autoRouted.traces.find((t) => t.id === traceId);
+    if (!baseTrace) return;
+    setEditedTraces((prev) => ({
+      ...prev,
+      [traceId]: { ...baseTrace, ...patch },
+    }));
+  };
+
+  const handleDeleteTrace = (traceId: string) => {
+    if (traceId.startsWith('custom-')) {
+      setCustomTraces((prev) => prev.filter((t) => t.id !== traceId));
+    } else {
+      setDeletedTraceIds((prev) => {
+        const next = new Set(prev);
+        next.add(traceId);
+        return next;
+      });
+      setEditedTraces((prev) => {
+        if (!(traceId in prev)) return prev;
+        const next = { ...prev };
+        delete next[traceId];
+        return next;
+      });
+    }
+    if (selectedTraceId === traceId) setSelectedTraceId(null);
+  };
+
+  const handleFixTraceConflicts = () => {
+    if (conflicts.length === 0) {
+      setFixNotice('Semua jalur PCB sudah bebas persinggungan.');
+      return;
+    }
+
+    const res = resolveTraceConflicts(
+      routed.traces,
+      routed.vias,
+      routed.placed,
+      config
+    );
+
+    const nextCustom: TraceSegment[] = [];
+    const nextEdited: Record<string, TraceSegment> = { ...editedTraces };
+
+    for (const tr of res.traces) {
+      if (tr.id.startsWith('custom-')) {
+        nextCustom.push(tr);
+      } else {
+        const orig = autoRouted.traces.find((a) => a.id === tr.id);
+        const changed =
+          !orig ||
+          orig.layer !== tr.layer ||
+          orig.points.length !== tr.points.length ||
+          orig.points.some(
+            (p, idx) =>
+              Math.abs(p.x - tr.points[idx].x) > 0.01 ||
+              Math.abs(p.y - tr.points[idx].y) > 0.01
+          );
+        if (changed) {
+          nextEdited[tr.id] = tr;
+        }
+      }
+    }
+
+    setCustomTraces(nextCustom);
+    setEditedTraces(nextEdited);
+
+    if (res.remainingConflicts.length === 0) {
+      setFixNotice(
+        `Berhasil memperbaiki ${conflicts.length} titik persinggungan secara otomatis.`
+      );
+    } else {
+      setFixNotice(
+        `${Math.max(0, conflicts.length - res.remainingConflicts.length)} diperbaiki, ${res.remainingConflicts.length} tersisa (aktifkan Dual Layer atau geser komponen).`
+      );
+    }
   };
 
   const handleJumpToView = (view: ViewMode, subTab?: 'mermaid' | 'json') => {
@@ -274,6 +493,7 @@ export default function App() {
 
   const selectedComp = placed.find((p) => p.uid === selectedUid) ?? null;
   const selectedDef = selectedComp ? CATALOG_MAP[selectedComp.defId] : null;
+  const selectedTrace = routed.traces.find((t) => t.id === selectedTraceId) ?? null;
   const activeMcu = placed.find((p) => CATALOG_MAP[p.defId]?.category === 'mcu');
   const activeMcuDef = activeMcu ? CATALOG_MAP[activeMcu.defId] : null;
 
@@ -290,6 +510,7 @@ export default function App() {
         return { ...c, pinOverrides: nextOverrides };
       })
     );
+    setEditedTraces({});
   };
 
   return (
@@ -432,10 +653,28 @@ export default function App() {
               config={config}
               routed={routed}
               selectedUid={selectedUid}
-              onSelectComponent={setSelectedUid}
+              selectedTraceId={selectedTraceId}
+              toolMode={toolMode}
+              drawLayer={drawLayer}
+              conflicts={conflicts}
+              fixNotice={fixNotice}
+              onSelectComponent={(uid) => {
+                setSelectedUid(uid);
+                if (uid) setSelectedTraceId(null);
+              }}
+              onSelectTrace={(tid) => {
+                setSelectedTraceId(tid);
+                if (tid) setSelectedUid(null);
+              }}
+              onChangeToolMode={setToolMode}
+              onChangeDrawLayer={setDrawLayer}
               onMoveComponent={handleMoveComponent}
               onRotateComponent={handleRotateComponent}
               onUpdateConfig={handleUpdateConfig}
+              onAddCustomTrace={handleAddCustomTrace}
+              onUpdateTrace={handleUpdateTrace}
+              onDeleteTrace={handleDeleteTrace}
+              onFixConflicts={handleFixTraceConflicts}
               onJumpToView={handleJumpToView}
             />
           )}
@@ -539,15 +778,18 @@ export default function App() {
                 </label>
                 <select
                   value={config.copperMode}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    const nextMode = e.target.value as BoardConfig['copperMode'];
                     handleUpdateConfig({
-                      copperMode: e.target.value as BoardConfig['copperMode'],
-                    })
-                  }
+                      copperMode: nextMode,
+                      visibleLayer: 'all',
+                      printLayerMode: nextMode === '1-layer' ? 'bottom' : 'both',
+                    });
+                  }}
                   className="w-full px-2 py-1.5 text-xs rounded bg-slate-900 border border-slate-800 text-slate-100 focus:outline-none focus:border-cyan-500"
                 >
-                  <option value="1-layer">1-Layer (DIY)</option>
-                  <option value="2-layer">2-Layer (Fab)</option>
+                  <option value="1-layer">Single Layer (1-Layer)</option>
+                  <option value="2-layer">Dual Layer (2-Layer)</option>
                 </select>
               </div>
               <div>
@@ -594,13 +836,44 @@ export default function App() {
                 onClick={() => {
                   setPlaced([]);
                   setSelectedUid(null);
+                  resetTraceEdits();
                 }}
-                disabled={placed.length === 0}
+                disabled={placed.length === 0 && customTraces.length === 0}
                 className="px-2.5 py-1.5 text-xs font-medium rounded bg-slate-900 hover:bg-rose-950/60 text-slate-400 hover:text-rose-300 border border-slate-800 disabled:opacity-40 transition-colors whitespace-nowrap"
               >
                 Bersihkan
               </button>
             </div>
+          </div>
+
+          {/* DRC Trace Conflict Status & Auto-Fix */}
+          <div className="p-3.5 border-b border-slate-800/80 space-y-2">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold text-slate-200">Cek Jalur (DRC)</span>
+              {conflicts.length === 0 ? (
+                <span className="inline-flex items-center gap-1 text-emerald-400 font-mono-tabular">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  0 Persinggungan
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-rose-400 font-semibold font-mono-tabular">
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  {conflicts.length} Persinggungan
+                </span>
+              )}
+            </div>
+            <button
+              onClick={handleFixTraceConflicts}
+              disabled={routed.traces.length === 0}
+              className={`w-full inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap disabled:opacity-40 ${
+                conflicts.length > 0
+                  ? 'bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/50 text-amber-300'
+                  : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-300'
+              }`}
+            >
+              <Wand2 className="w-3.5 h-3.5" />
+              Perbaiki Jalur Otomatis
+            </button>
           </div>
 
           {/* Warnings */}
@@ -615,6 +888,76 @@ export default function App() {
                   <span>{w}</span>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* Selected Trace Inspector */}
+          {selectedTrace && (
+            <div className="p-3.5 border-b border-slate-800/80 bg-cyan-950/20 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-cyan-300 font-mono-tabular truncate">
+                    Jalur: {selectedTrace.netName}
+                  </div>
+                  <div className="text-[11px] font-mono-tabular text-slate-400">
+                    {selectedTrace.points.length} titik · {selectedTrace.id.startsWith('custom-') ? 'Manual' : 'Auto'}
+                  </div>
+                </div>
+                <button
+                  onClick={() => handleDeleteTrace(selectedTrace.id)}
+                  className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded bg-rose-950/70 hover:bg-rose-900 text-rose-200 border border-rose-800/70 transition-colors whitespace-nowrap shrink-0"
+                  title="Hapus Jalur (Del)"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  Hapus
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">
+                    Layer Tembaga
+                  </label>
+                  <select
+                    value={selectedTrace.layer}
+                    disabled={config.copperMode === '1-layer'}
+                    onChange={(e) =>
+                      handleUpdateTrace(selectedTrace.id, {
+                        layer: e.target.value as 'F.Cu' | 'B.Cu',
+                      })
+                    }
+                    className="w-full px-2 py-1 text-xs rounded bg-slate-900 border border-slate-700 text-slate-100 disabled:opacity-60 focus:outline-none"
+                  >
+                    <option value="B.Cu">Bottom (B.Cu)</option>
+                    {config.copperMode === '2-layer' && (
+                      <option value="F.Cu">Top (F.Cu)</option>
+                    )}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">
+                    Lebar Jalur
+                  </label>
+                  <select
+                    value={selectedTrace.widthMm}
+                    onChange={(e) =>
+                      handleUpdateTrace(selectedTrace.id, {
+                        widthMm: Number(e.target.value),
+                      })
+                    }
+                    className="w-full px-2 py-1 text-xs font-mono-tabular rounded bg-slate-900 border border-slate-700 text-slate-100 focus:outline-none"
+                  >
+                    <option value={0.4}>0.4 mm</option>
+                    <option value={0.6}>0.6 mm</option>
+                    <option value={0.8}>0.8 mm</option>
+                    <option value={1.0}>1.0 mm</option>
+                    <option value={1.2}>1.2 mm</option>
+                  </select>
+                </div>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-snug">
+                Seret titik biru pada jalur untuk mengubah rute, klik ikon + di tengah segmen untuk tambah belokan.
+              </p>
             </div>
           )}
 
@@ -728,7 +1071,10 @@ export default function App() {
                   return (
                     <div
                       key={comp.uid}
-                      onClick={() => setSelectedUid(comp.uid)}
+                      onClick={() => {
+                        setSelectedUid(comp.uid);
+                        setSelectedTraceId(null);
+                      }}
                       className={`px-2.5 py-2 flex items-center justify-between gap-2 cursor-pointer transition-colors ${
                         isSel ? 'bg-cyan-500/10' : 'hover:bg-slate-900/60'
                       }`}

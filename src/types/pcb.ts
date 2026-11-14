@@ -120,12 +120,28 @@ export interface BomItem {
 export type ViewMode = 'pcb' | 'toner' | 'wiring' | 'mermaid' | 'sketch' | 'bom';
 export type CopperMode = '1-layer' | '2-layer';
 export type SolderMaskColor = 'green' | 'black' | 'blue' | 'red';
+export type LayerViewFilter = 'all' | 'F.Cu' | 'B.Cu';
+export type PrintLayerMode = 'bottom' | 'top' | 'both';
+export type PcbToolMode = 'select' | 'draw' | 'edit' | 'delete';
+
+export interface TraceConflict {
+  id: string;
+  xMm: number;
+  yMm: number;
+  layer: 'F.Cu' | 'B.Cu';
+  traceAId: string;
+  traceBId: string;
+  netA: string;
+  netB: string;
+}
 
 export interface BoardConfig {
   projectName: string;
   widthMm: number;
   heightMm: number;
   copperMode: CopperMode;
+  visibleLayer: LayerViewFilter;
+  printLayerMode: PrintLayerMode;
   traceWidthMm: number;
   solderMask: SolderMaskColor;
   mirrorToner: boolean;
