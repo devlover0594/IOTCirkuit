@@ -1,0 +1,6 @@
+{
+  "name": "TraceForge PCB — ESP & Arduino PCB Maker",
+  "description": "Automated PCB layout, schematic generator, Arduino C++ sketch parser, Mermaid wiring diagram visualizer, BOM list, Gerber RS-274X & toner-transfer print exporter for ESP32 and Arduino projects.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
